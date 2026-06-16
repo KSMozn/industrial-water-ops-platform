@@ -1,0 +1,443 @@
+// Industrial Water Operations Platform — Postgres schema
+//
+// Modeling notes:
+//   - `Site` is the unit of operations: a customer location where deployed equipment lives.
+//   - `Customer` owns one or more `Site`s and is the unit of sales.
+//   - `ServiceVisit` is a technician trip; `LabResult` captures the analytical readings from samples.
+//   - `Task` is a lightweight work-item unifying findings from service, lab anomalies, and ad-hoc requests.
+//   - `Equipment` is a deployed serial-numbered unit; `EquipmentModel` is the catalog SKU.
+//   - `Shipment` + `ShipmentLine` model the offshore-manufacturing reconciliation flow.
+//   - `WorkOrder` + `WorkOrderStation` model the workshop MES build pipeline.
+//   - `Quote` / `QuoteLine` replaces the Salesforce flow, and a quote can convert into a WorkOrder.
+//
+// Conventions:
+//   - All ids are cuid() for stable, non-sequential identifiers safe for URLs.
+//   - All tables track createdAt/updatedAt for audit and sync.
+//   - Enums are used where the value set is small and stable; free-text status fields are avoided.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Sales / CRM ----------
+
+model Customer {
+  id          String   @id @default(cuid())
+  name        String
+  abn         String?  // Australian Business Number
+  contactName String?
+  contactEmail String?
+  contactPhone String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  sites     Site[]
+  quotes    Quote[]
+}
+
+model Site {
+  id          String   @id @default(cuid())
+  customerId  String
+  name        String
+  addressLine String
+  city        String
+  state       String   // NSW, VIC, QLD, WA, SA, TAS, ACT, NT
+  postcode    String
+  latitude    Float?
+  longitude   Float?
+  industry    String?  // e.g. "Food & Beverage", "Mining", "Wastewater"
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  customer    Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  equipment   Equipment[]
+  visits      ServiceVisit[]
+  tasks       Task[]
+  labResults  LabResult[]
+
+  @@index([customerId])
+  @@index([state])
+}
+
+// ---------- Service Operations ----------
+
+model Technician {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  phone     String?
+  region    String?  // service region
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  visits ServiceVisit[]
+  tasks  Task[]
+}
+
+enum VisitStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model ServiceVisit {
+  id           String       @id @default(cuid())
+  siteId       String
+  technicianId String?
+  scheduledFor DateTime
+  completedAt  DateTime?
+  status       VisitStatus  @default(SCHEDULED)
+  findings     String?      // free-text technician notes
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  site        Site         @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  technician  Technician?  @relation(fields: [technicianId], references: [id])
+  labResults  LabResult[]
+  tasks       Task[]
+
+  @@index([siteId])
+  @@index([status])
+  @@index([scheduledFor])
+}
+
+// ---------- Lab Results + AI Review ----------
+
+enum LabResultStatus {
+  PENDING_REVIEW
+  REVIEWED_OK
+  REVIEWED_ANOMALY
+  REVIEW_FAILED
+}
+
+// LabResult stores the raw input (a lab PDF transcription or analyzer dump),
+// the structured readings after AI extraction + deterministic validation, and a
+// reference to the AI review record. Raw input is preserved so we can re-run
+// extraction if prompts/models change.
+model LabResult {
+  id           String          @id @default(cuid())
+  siteId       String
+  visitId      String?
+  sampledAt    DateTime
+  rawInput     String          // original text/transcription submitted for review
+  status       LabResultStatus @default(PENDING_REVIEW)
+
+  // Structured readings — populated by AI extraction then validated.
+  ph           Float?
+  conductivity Float?  // µS/cm
+  chlorine     Float?  // mg/L
+  turbidity    Float?  // NTU
+  iron         Float?  // mg/L
+  hardness     Float?  // mg/L as CaCO3
+
+  anomalies    Json?           // [{ parameter, value, threshold, severity, message }]
+  suggestedActions Json?       // [{ action, rationale }]
+
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  site   Site          @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  visit  ServiceVisit? @relation(fields: [visitId], references: [id])
+  review AiReview?
+  tasks  Task[]
+
+  @@index([siteId])
+  @@index([status])
+}
+
+// AiReview persists the full audit trail of any AI inference run on the
+// platform — prompt, raw response, latency, token usage, and the post-validation
+// confidence score. Decoupled from LabResult so the same table can later cover
+// other agent flows (quote summarization, technician note triage).
+model AiReview {
+  id           String   @id @default(cuid())
+  labResultId  String   @unique
+  provider     String   // claude | openai | mock
+  model        String
+  promptTokens Int?
+  outputTokens Int?
+  latencyMs    Int?
+  rawResponse  Json     // raw model output
+  parsed       Json?    // structured extraction
+  confidence   Float?   // 0..1 — post-validation confidence score
+  validationErrors Json? // array of validator failures, [] when clean
+  createdAt    DateTime @default(now())
+
+  labResult LabResult @relation(fields: [labResultId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Tasks ----------
+
+enum TaskStatus {
+  REQUESTED
+  APPROVED
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskSource {
+  SERVICE_VISIT
+  LAB_ANOMALY
+  MANUAL
+  WORKSHOP
+  QUOTE
+}
+
+model Task {
+  id           String       @id @default(cuid())
+  siteId       String
+  technicianId String?
+  visitId      String?
+  labResultId  String?
+  title        String
+  description  String?
+  priority     TaskPriority @default(MEDIUM)
+  status       TaskStatus   @default(REQUESTED)
+  source       TaskSource   @default(MANUAL)
+  dueDate      DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  site       Site          @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  technician Technician?   @relation(fields: [technicianId], references: [id])
+  visit      ServiceVisit? @relation(fields: [visitId], references: [id])
+  labResult  LabResult?    @relation(fields: [labResultId], references: [id])
+
+  @@index([status])
+  @@index([siteId])
+  @@index([priority])
+  @@index([dueDate])
+}
+
+// ---------- Inventory ----------
+
+enum InventoryKind {
+  EQUIPMENT
+  CHEMICAL
+  SPARE_PART
+}
+
+model InventoryItem {
+  id          String        @id @default(cuid())
+  sku         String        @unique
+  name        String
+  kind        InventoryKind
+  unit        String        // "ea", "L", "kg"
+  stockOnHand Int           @default(0)
+  reorderLevel Int          @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  models      EquipmentModel[]
+}
+
+// EquipmentModel is the catalog entry; an Equipment row is a serial-numbered
+// deployed instance.
+model EquipmentModel {
+  id             String   @id @default(cuid())
+  inventoryItemId String?
+  modelCode      String   @unique
+  description    String
+  createdAt      DateTime @default(now())
+
+  inventoryItem InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+  units         Equipment[]
+  shipmentLines ShipmentLine[]
+  workOrders    WorkOrder[]
+}
+
+enum EquipmentStatus {
+  IN_WORKSHOP
+  AWAITING_DISPATCH
+  DEPLOYED
+  IN_SERVICE
+  RETURNED
+  DECOMMISSIONED
+}
+
+model Equipment {
+  id              String          @id @default(cuid())
+  serialNumber    String          @unique
+  modelId         String
+  siteId          String?
+  status          EquipmentStatus @default(IN_WORKSHOP)
+  commissionedAt  DateTime?
+  shipmentLineId  String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  model         EquipmentModel @relation(fields: [modelId], references: [id])
+  site          Site?          @relation(fields: [siteId], references: [id])
+  shipmentLine  ShipmentLine?  @relation(fields: [shipmentLineId], references: [id])
+
+  @@index([siteId])
+  @@index([status])
+}
+
+// ---------- Offshore manufacturing reconciliation ----------
+
+enum ShipmentStatus {
+  EXPECTED
+  RECEIVED
+  RECONCILED
+  DISCREPANCY
+}
+
+model Shipment {
+  id              String         @id @default(cuid())
+  reference       String         @unique  // PO / shipment number
+  origin          String         // "Offshore — Shenzhen", "Offshore — Vietnam"
+  expectedAt      DateTime
+  receivedAt      DateTime?
+  status          ShipmentStatus @default(EXPECTED)
+  notes           String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  lines ShipmentLine[]
+}
+
+// One ShipmentLine per (model, expected serial) — receivedSerial may differ
+// (mismatch) or be null (missing). Reconciliation surfaces both.
+model ShipmentLine {
+  id              String   @id @default(cuid())
+  shipmentId      String
+  modelId         String
+  expectedSerial  String
+  receivedSerial  String?
+  receivedAt      DateTime?
+  notes           String?
+  createdAt       DateTime @default(now())
+
+  shipment   Shipment        @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  model      EquipmentModel  @relation(fields: [modelId], references: [id])
+  equipment  Equipment[]
+
+  @@index([shipmentId])
+  @@index([expectedSerial])
+}
+
+// ---------- Workshop MES ----------
+
+enum WorkOrderStatus {
+  QUEUED
+  IN_PROGRESS
+  BLOCKED
+  QA
+  DISPATCHED
+  CANCELLED
+}
+
+enum StationKey {
+  FRAME
+  PLUMBING
+  ELECTRICAL
+  QA
+  DISPATCH
+}
+
+enum StationStatus {
+  PENDING
+  IN_PROGRESS
+  BLOCKED
+  DONE
+  SKIPPED
+}
+
+model WorkOrder {
+  id           String          @id @default(cuid())
+  reference    String          @unique  // e.g. "WO-2026-0042"
+  modelId      String
+  serialNumber String?         // assigned once dispatched
+  status       WorkOrderStatus @default(QUEUED)
+  quoteId      String?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  model    EquipmentModel       @relation(fields: [modelId], references: [id])
+  quote    Quote?               @relation(fields: [quoteId], references: [id])
+  stations WorkOrderStation[]
+
+  @@index([status])
+}
+
+model WorkOrderStation {
+  id          String        @id @default(cuid())
+  workOrderId String
+  station     StationKey
+  sequence    Int           // station ordering for this WO
+  status      StationStatus @default(PENDING)
+  startedAt   DateTime?
+  completedAt DateTime?
+  blockedReason String?
+  operatorName  String?
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  workOrder WorkOrder @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([workOrderId, station])
+  @@index([status])
+}
+
+// ---------- Quotes ----------
+
+enum QuoteStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  CONVERTED  // converted into a WorkOrder or Task
+  EXPIRED
+}
+
+model Quote {
+  id           String      @id @default(cuid())
+  reference    String      @unique  // e.g. "Q-2026-0117"
+  customerId   String
+  status       QuoteStatus @default(DRAFT)
+  totalAud     Float       @default(0)
+  validUntil   DateTime?
+  sentAt       DateTime?
+  decidedAt    DateTime?
+  notes        String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  customer   Customer    @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  lines      QuoteLine[]
+  workOrders WorkOrder[]
+
+  @@index([customerId])
+  @@index([status])
+}
+
+model QuoteLine {
+  id          String   @id @default(cuid())
+  quoteId     String
+  description String
+  quantity    Int      @default(1)
+  unitPriceAud Float
+  createdAt   DateTime @default(now())
+
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+}

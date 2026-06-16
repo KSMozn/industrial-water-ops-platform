@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: waterops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: waterops
+      POSTGRES_PASSWORD: waterops
+      POSTGRES_DB: waterops
+    ports:
+      - "5432:5432"
+    volumes:
+      - waterops-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U waterops -d waterops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./apps/api
+    container_name: waterops-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://waterops:waterops@postgres:5432/waterops?schema=public
+      API_PORT: 4000
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "4000:4000"
+    command: sh -c "npx prisma migrate deploy && npm run seed && node src/server.js"
+
+  web:
+    build:
+      context: ./apps/web
+    container_name: waterops-web
+    depends_on:
+      - api
+    environment:
+      VITE_API_BASE_URL: http://localhost:4000
+    ports:
+      - "5173:5173"
+
+volumes:
+  waterops-pg:
